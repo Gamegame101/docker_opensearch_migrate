@@ -5,6 +5,8 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Configuration
 const BATCH_SIZE = 1000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
@@ -13,6 +15,41 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
   db: { schema: 'api' }
 });
+
+// Sleep function for retry delay
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Retry upsert with all error handling
+async function upsertWithRetry(data, maxRetries = MAX_RETRIES) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { error } = await supabase
+        .from('pageseeker_response_opensearch')
+        .upsert(data, { onConflict: 'id' });
+
+      if (error) {
+        if (attempt < maxRetries) {
+          console.log(`❌ Error (attempt ${attempt}/${maxRetries}): ${error.message}, retrying in ${RETRY_DELAY}ms...`);
+          await sleep(RETRY_DELAY);
+          continue;
+        } else {
+          throw error; // Final attempt failed
+        }
+      }
+
+      return { success: true, error: null };
+    } catch (err) {
+      if (attempt === maxRetries) {
+        return { success: false, error: err };
+      }
+      
+      console.log(`❌ Error (attempt ${attempt}/${maxRetries}): ${err.message}, retrying in ${RETRY_DELAY}ms...`);
+      await sleep(RETRY_DELAY);
+    }
+  }
+}
 
 // Parse ad_date text → { ad_date: 'YYYY-MM-DD', active_time_hr: number }
 function parseAdDate(adDateText) {
@@ -101,24 +138,24 @@ async function main() {
   console.log('='.repeat(60));
 
   while (true) {
-    // ดึง batch จาก source table โดยใช้ cursor-based pagination (id > lastId)
-    const { data: rows, error: fetchErr } = await supabase
+    // Query batch - ดึง records ถัดจาก lastId
+    console.log(`📋 Fetching batch (lastId=${lastId})...`);
+    let query = supabase
       .from('pageseeker_response')
-      .select('id, keyword, ad_id, ad_url, page_url, ad_date, ad_name, ad_profile_url, ad_caption, ad_links, image_urls, video_urls, collected_at, ad_risk_level, ad_risk_reason, request_id')
-      .gt('id', lastId)
+      .select('*')
       .order('id', { ascending: true })
       .limit(BATCH_SIZE);
+    
+    // เพิ่ม WHERE clause ถ้า lastId > 0
+    if (lastId > 0) {
+      query = query.gt('id', lastId);
+    }
+    
+    const { data: rows, error } = await query;
 
-    if (fetchErr) {
-      console.error(`❌ Error fetching batch (lastId=${lastId}):`, fetchErr.message);
-      totalErrors++;
-      // ลอง skip batch นี้
-      lastId += BATCH_SIZE;
-      if (totalErrors > 10) {
-        console.error('❌ Too many errors, stopping');
-        break;
-      }
-      continue;
+    if (error) {
+      console.error('❌ Query error:', error);
+      process.exit(1);
     }
 
     if (!rows || rows.length === 0) {
@@ -129,20 +166,47 @@ async function main() {
     // Transform ทุก row
     const transformed = rows.map(transformRow);
 
-    // Upsert batch
-    const { error: upsertErr } = await supabase
+    // หาว่ามี record ไหนอยู่ใน dest แล้ว (เร็วกว่า query ทีละ record)
+    const ids = rows.map(row => row.id);
+    const { data: existingRecords } = await supabase
       .from('pageseeker_response_opensearch')
-      .upsert(transformed, {
-        onConflict: 'id',
-        ignoreDuplicates: false
-      });
-
-    if (upsertErr) {
-      console.error(`❌ Upsert error (lastId=${lastId}):`, upsertErr.message);
+      .select('id')
+      .in('id', ids);
+    
+    const existingIds = new Set(existingRecords?.map(r => r.id) || []);
+    
+    // กรองเฉพาะที่ยังไม่มีใน dest (ใหม่)
+    const newRecords = transformed.filter(record => !existingIds.has(record.id));
+    
+    if (newRecords.length === 0) {
+      console.log(`✅ All ${rows.length} records already exist, skipping batch`);
+      totalProcessed += rows.length;
+      lastId = rows[rows.length - 1].id;
+      
+      // Progress สำหรับ skip batch
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = totalProcessed / elapsed;
+      const pct = sourceCount ? ((totalProcessed / sourceCount) * 100).toFixed(1) : '?';
+      console.log(`📊 Overall progress: ${totalProcessed.toLocaleString()}/${sourceCount?.toLocaleString()} (${pct}%) | ${rate.toFixed(0)} rec/s | lastId=${lastId}`);
+      
+      continue;
+    }
+    
+    console.log(`📊 Processing ${newRecords.length} new records (skipped ${rows.length - newRecords.length} existing)`);
+    
+    // Upsert เฉพาะที่ใหม่
+    const retryResult = await upsertWithRetry(newRecords);
+    
+    if (retryResult.error) {
+      console.error(`❌ Upsert error:`, retryResult.error.message);
       totalErrors++;
     } else {
-      totalUpserted += transformed.length;
+      totalUpserted += newRecords.length;
+      console.log(`✅ Batch upserted: ${newRecords.length} new records`);
     }
+    
+    // Batch summary
+    console.log(`✅ Batch completed: ${newRecords.length} new records processed`);
 
     totalProcessed += rows.length;
     lastId = rows[rows.length - 1].id;
@@ -151,7 +215,7 @@ async function main() {
     const elapsed = (Date.now() - startTime) / 1000;
     const rate = totalProcessed / elapsed;
     const pct = sourceCount ? ((totalProcessed / sourceCount) * 100).toFixed(1) : '?';
-    console.log(`📊 Progress: ${totalProcessed.toLocaleString()}/${sourceCount?.toLocaleString()} (${pct}%) | ${rate.toFixed(0)} rec/s | lastId=${lastId}`);
+    console.log(`📊 Overall progress: ${totalProcessed.toLocaleString()}/${sourceCount?.toLocaleString()} (${pct}%) | ${rate.toFixed(0)} rec/s | lastId=${lastId}`);
   }
 
   const elapsed = (Date.now() - startTime) / 1000;
