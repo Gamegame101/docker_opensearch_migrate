@@ -155,6 +155,18 @@ async function main() {
 
     if (error) {
       console.error('❌ Query error:', error);
+      
+      // Check if it's a connection/termination error
+      if (error.message && (
+        error.message.includes('terminated') || 
+        error.message.includes('timeout') ||
+        error.message.includes('connection')
+      )) {
+        console.log('⏱️ Connection error, retrying in 2 seconds...');
+        await sleep(2000);
+        continue; // Retry this batch
+      }
+      
       process.exit(1);
     }
 
@@ -168,10 +180,30 @@ async function main() {
 
     // หาว่ามี record ไหนอยู่ใน dest แล้ว (เร็วกว่า query ทีละ record)
     const ids = rows.map(row => row.id);
-    const { data: existingRecords } = await supabase
-      .from('pageseeker_response_opensearch')
-      .select('id')
-      .in('id', ids);
+    let existingRecords;
+    
+    try {
+      const result = await supabase
+        .from('pageseeker_response_opensearch')
+        .select('id')
+        .in('id', ids);
+      existingRecords = result.data;
+    } catch (error) {
+      console.error('❌ Existing records query error:', error);
+      
+      // Check if it's a connection/termination error
+      if (error.message && (
+        error.message.includes('terminated') || 
+        error.message.includes('timeout') ||
+        error.message.includes('connection')
+      )) {
+        console.log('⏱️ Connection error, retrying in 2 seconds...');
+        await sleep(2000);
+        continue; // Retry this batch
+      }
+      
+      process.exit(1);
+    }
     
     const existingIds = new Set(existingRecords?.map(r => r.id) || []);
     
